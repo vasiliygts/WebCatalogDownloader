@@ -321,6 +321,8 @@ class App(tk.Tk):
         self.tree.bind("<Button-1>", self.on_click)
         self.tree.bind("<space>", self.on_space)
         self.tree.bind("<<TreeviewOpen>>", self.on_expand)
+        self.tree.bind("<Control-KeyPress>", self._on_tree_ctrl_key)
+        self._build_tree_menu()
 
         # --- низ
         bot = ttk.Frame(self)
@@ -399,6 +401,76 @@ class App(tk.Tk):
                 m.grab_release()
 
         widget.bind("<Button-3>", popup)
+
+    # ------------------------------------------------- копіювання виділеного
+    def _ordered_selection(self):
+        """Виділені рядки у порядку дерева (а не в порядку кліків)."""
+        sel = set(self.tree.selection())
+        out = []
+
+        def walk(node):
+            for k in self.tree.get_children(node):
+                if k in sel and k in self.nodes:
+                    out.append(k)
+                walk(k)
+
+        walk("")
+        return out
+
+    def _copy_selection(self, mode="url"):
+        rows = self._ordered_selection()
+        if not rows:
+            self.status.set("Нічого не виділено (виділяйте рядки по колонці «Назва»).")
+            return
+        lines = []
+        for iid in rows:
+            n = self.nodes[iid]
+            if mode == "url":
+                lines.append(n["url"])
+            elif mode == "name":
+                lines.append(n["name"] + ("/" if n["is_dir"] else ""))
+            else:  # row: назва / розмір / дата — як видно в таблиці
+                lines.append("\t".join((
+                    n["name"] + ("/" if n["is_dir"] else ""),
+                    self.tree.set(iid, "size"),
+                    self.tree.set(iid, "date"),
+                )))
+        text = "\r\n".join(lines)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()          # віддати буфер системі
+        self.say(f"Скопійовано {len(lines)} рядків у буфер ({mode}).")
+        self.status.set(f"У буфері: {len(lines)} рядків — вставляйте у Блокнот (Ctrl+V).")
+
+    def _on_tree_ctrl_key(self, event):
+        if not (event.state & 0x0004):                        # немає Control
+            return
+        if event.keycode == 67 or event.keysym.lower() in ("c", "cyrillic_es"):
+            self._copy_selection("url")
+            return "break"
+
+    def _build_tree_menu(self):
+        m = tk.Menu(self.tree, tearoff=0)
+        m.add_command(label="Копіювати URL (по рядку)",
+                      command=lambda: self._copy_selection("url"))
+        m.add_command(label="Копіювати назви",
+                      command=lambda: self._copy_selection("name"))
+        m.add_command(label="Копіювати рядки: назва / розмір / дата",
+                      command=lambda: self._copy_selection("row"))
+        self._tree_menu = m
+
+        def popup(e):
+            row = self.tree.identify_row(e.y)
+            if row and row not in self.tree.selection():
+                self.tree.selection_set(row)
+                self.tree.focus(row)
+            if self.tree.selection():
+                try:
+                    m.tk_popup(e.x_root, e.y_root)
+                finally:
+                    m.grab_release()
+
+        self.tree.bind("<Button-3>", popup)
 
     # ------------------------------------------------------- допоміжне
     def auth(self):
