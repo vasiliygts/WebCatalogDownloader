@@ -291,6 +291,11 @@ class App(tk.Tk):
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(bar, text="Експорт списку URL", command=self.export_list).pack(side="left")
+        ttk.Button(bar, text="rclone-фільтр…", command=self.export_rclone_filter).pack(side="left", padx=4)
+
+        self.selinfo_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.selinfo_var,
+                  foreground="#1c6fe0").pack(side="right", padx=6)
 
         # --- дерево
         wrap = ttk.Frame(self)
@@ -321,6 +326,7 @@ class App(tk.Tk):
         self.tree.bind("<Button-1>", self.on_click)
         self.tree.bind("<space>", self.on_space)
         self.tree.bind("<<TreeviewOpen>>", self.on_expand)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Control-KeyPress>", self._on_tree_ctrl_key)
         self._build_tree_menu()
 
@@ -417,6 +423,28 @@ class App(tk.Tk):
         walk("")
         return out
 
+    def _on_tree_select(self, _e=None):
+        """Живий підрахунок того, що виділено синім (не галочки)."""
+        sel = [self.nodes[i] for i in self.tree.selection() if i in self.nodes]
+        if not sel:
+            self.selinfo_var.set("")
+            return
+        files = [n for n in sel if not n["is_dir"]]
+        dirs = [n for n in sel if n["is_dir"]]
+        total = sum(n["size"] for n in files)
+        approx = False
+        for n in dirs:
+            total += n.get("_dsize", 0)
+            if not n.get("_dcomplete"):
+                approx = True          # папка не просканована повністю
+        parts = []
+        if files:
+            parts.append(f"файлів: {len(files)}")
+        if dirs:
+            parts.append(f"папок: {len(dirs)}")
+        self.selinfo_var.set(f"Виділено   {'   '.join(parts)}   "
+                             f"{'≈ ' if approx else ''}{bytes_to_human(total)}")
+
     def _copy_selection(self, mode="url"):
         rows = self._ordered_selection()
         if not rows:
@@ -451,12 +479,6 @@ class App(tk.Tk):
 
     def _build_tree_menu(self):
         m = tk.Menu(self.tree, tearoff=0)
-        m.add_command(label="Копіювати URL (по рядку)",
-                      command=lambda: self._copy_selection("url"))
-        m.add_command(label="Копіювати назви",
-                      command=lambda: self._copy_selection("name"))
-        m.add_command(label="Копіювати рядки: назва / розмір / дата",
-                      command=lambda: self._copy_selection("row"))
         self._tree_menu = m
 
         def popup(e):
@@ -464,6 +486,18 @@ class App(tk.Tk):
             if row and row not in self.tree.selection():
                 self.tree.selection_set(row)
                 self.tree.focus(row)
+            m.delete(0, "end")
+            node = self.nodes.get(row)
+            if node and node["is_dir"]:
+                m.add_command(label="Просканувати рекурсивно",
+                              command=lambda r=row: self.scan_subtree(r))
+                m.add_separator()
+            m.add_command(label="Копіювати URL (по рядку)",
+                          command=lambda: self._copy_selection("url"))
+            m.add_command(label="Копіювати назви",
+                          command=lambda: self._copy_selection("name"))
+            m.add_command(label="Копіювати рядки: назва / розмір / дата",
+                          command=lambda: self._copy_selection("row"))
             if self.tree.selection():
                 try:
                     m.tk_popup(e.x_root, e.y_root)
@@ -707,13 +741,32 @@ class App(tk.Tk):
         self.stop_btn.config(state="normal")
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
-    def _scan_worker(self):
-        seen = 0
+    def scan_subtree(self, iid):
+        """Рекурсивно обійти лише одну вибрану папку."""
+        node = self.nodes.get(iid)
+        if not node or not node["is_dir"] or self.busy:
+            return
+        self.busy = True
+        self.stop_evt.clear()
+        self.stop_btn.config(state="normal")
+        self.status.set(f"Рекурсивне сканування: {node['name']}…")
+        self._ensure_loaded(iid)
+        threading.Thread(target=self._scan_worker,
+                         args=(node["url"],), daemon=True).start()
+
+    def _scan_worker(self, prefix=None):
+        seen, empty = 0, 0
         while not self.stop_evt.is_set():
             pending = [i for i, n in self.nodes.items()
-                       if n["is_dir"] and not n["loaded"]]
+                       if n["is_dir"] and not n["loaded"]
+                       and (prefix is None or n["url"].startswith(prefix))]
             if not pending:
-                break
+                empty += 1                       # діти щойно просканованих ще їдуть у чергу
+                if empty >= 3:
+                    break
+                threading.Event().wait(0.3)
+                continue
+            empty = 0
             for iid in pending:
                 if self.stop_evt.is_set():
                     break
@@ -874,7 +927,7 @@ class App(tk.Tk):
     def _update_status_counts(self):
         files = self.selected_files()
         total = sum(n["size"] for _, n in files)
-        self.status.set(f"Вибрано файлів: {len(files)}   ≈ {bytes_to_human(total)}")
+        self.status.set(f"Відмічено галочками: {len(files)} файлів  •  {bytes_to_human(total)}")
 
     # ------------------------------------------------------ експорт
     def export_list(self):
@@ -891,6 +944,65 @@ class App(tk.Tk):
                 f.write(n["url"] + "\n")
         self.say(f"Збережено {len(files)} URL → {path}")
         self.say("Можна згодувати в:  wget -x -c -i urls.txt   або   aria2c -i urls.txt -x8 -j4 -c")
+
+    # ---------------------------------------------- rclone-фільтр
+    def _rclone_filter_text(self):
+        """Зі стану галочок → rclone --filter-from: цілі папки як /шлях/**, окремі файли поштучно."""
+        root = self.url_var.get().strip()
+        host = ""
+        if root.startswith(("http://", "https://")):
+            pr = urlparse(root)
+            host = f"{pr.scheme}://{pr.netloc}"
+
+        def esc(seg):
+            for ch in "\\*?[]{}":
+                seg = seg.replace(ch, "\\" + ch)
+            return seg
+
+        def path_of(n):
+            p = unquote(urlparse(n["url"]).path)
+            return "/".join(esc(s) for s in p.split("/"))
+
+        lines = []
+
+        def walk(parent):
+            for iid in self.tree.get_children(parent):
+                n = self.nodes.get(iid)
+                if not n:
+                    continue
+                if n["is_dir"]:
+                    if n["state"] == ON:                       # ціла папка
+                        lines.append(f"+ {path_of(n).rstrip('/')}/**")
+                    elif n["state"] == PART:                   # частково — углиб
+                        walk(iid)
+                elif n["state"] == ON:                         # окремий файл
+                    lines.append(f"+ {path_of(n)}")
+
+        walk("")
+        if not lines:
+            return None
+        head = ["# rclone selection manifest"]
+        if host:
+            head.append(f"# HTTP_ROOT = {host}")
+        return "\n".join(head + lines + ["- **"]) + "\n"
+
+    def export_rclone_filter(self):
+        txt = self._rclone_filter_text()
+        if not txt:
+            messagebox.showinfo("rclone-фільтр", "Нічого не вибрано.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                            initialfile="rclone_filter.txt")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        self.clipboard_clear()
+        self.clipboard_append(txt)
+        self.update_idletasks()
+        self.say(f"rclone-фільтр → {path}  (і скопійовано в буфер):")
+        for l in txt.splitlines():
+            self.say("  " + l)
 
     # ------------------------------------------------------ завантаження
     def pick_dir(self):
